@@ -1,0 +1,4 @@
+name = "cf-workers-proxy"
+main = "_worker.js"
+type = "javascript"
+compatibility_date = "2026-01-01"
