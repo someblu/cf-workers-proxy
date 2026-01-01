@@ -1,4 +1,13 @@
-name = "cf-workers-proxy"
+name = "github-proxy"
 main = "_worker.js"
 type = "javascript"
 compatibility_date = "2026-01-01"
+
+[vars]
+PROXY_HOSTNAME = "github.com"
+PATHNAME_REGEX = "^/.+?/.+?/(releases|archive|blob|raw)"
+UA_WHITELIST_REGEX = "^(curl|Wget)"
+
+[[routes]]
+pattern = "github.neco.sh"
+custom_domain = true
