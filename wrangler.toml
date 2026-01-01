@@ -1,3 +1,9 @@
-name = "cf-workers-proxy"
-main = "_worker.js"
+name = "github-proxy"
+main = "github.js"
 compatibility_date = "2026-01-01"
+
+[vars]
+PROXY_HOSTNAME = "github.com"
+RELEASE_PATHNAME_REGEX = "^/[^/]+/[^/]+/releases/download/[^/]+/.+"
+GITHUB_RAW_PATHNAME_REGEX = "^/[^/]+/[^/]+/raw/.+"
+UA_WHITELIST_REGEX = "^(curl|wget)"
