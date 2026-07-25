@@ -1,6 +1,21 @@
 name = "github-proxy"
 main = "github.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-07-24"
+
+[cache]
+enabled = true
+
+[exports.default]
+type = "worker"
+
+  [exports.default.cache]
+  enabled = false
+
+[exports.CachedGitHubProxy]
+type = "worker"
+
+  [exports.CachedGitHubProxy.cache]
+  enabled = true
 
 [vars]
 PROXY_HOSTNAME = "github.com"

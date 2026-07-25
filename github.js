@@ -1,3 +1,5 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+
 const DEFAULT_PROXY_HOSTNAME = "github.com";
 const DEFAULT_PROXY_PROTOCOL = "https";
 const DEFAULT_RELEASE_PATHNAME_REGEX =
@@ -5,9 +7,10 @@ const DEFAULT_RELEASE_PATHNAME_REGEX =
 const DEFAULT_GITHUB_RAW_PATHNAME_REGEX = "^/[^/]+/[^/]+/raw/.+";
 const HSTS_HEADER_VALUE = "max-age=31536000";
 
-// 边缘缓存 TTL（秒）
+// Workers Cache TTL（秒）
 const RELEASE_CACHE_TTL = 2592000; // 30 天：release 资源按 tag 发布，基本不变
 const RAW_CACHE_TTL = 300; // 5 分钟：raw 指向分支，内容会变
+const RAW_COMMIT_CACHE_TTL = 2592000; // 30 天：40 位 commit SHA 不可变
 
 const SENSITIVE_REQUEST_HEADERS = [
   "cookie",
@@ -25,7 +28,11 @@ const CLIENT_FORWARDING_HEADERS = [
   "cdn-loop",
   "forwarded",
   "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-forwarded-proto",
   "x-real-ip",
+  "true-client-ip",
 ];
 const STRIP_RESPONSE_HEADERS = [
   "set-cookie",
@@ -47,8 +54,8 @@ const STRIP_RESPONSE_HEADERS = [
 function logError(request, message) {
   console.error(
     `${message}, clientIp: ${request.headers.get(
-      "cf-connecting-ip"
-    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
+      "cf-connecting-ip",
+    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`,
   );
 }
 
@@ -70,7 +77,7 @@ function textResponse(status, body, headers = {}) {
   const responseHeaders = new Headers(headers);
   responseHeaders.set("cache-control", "no-store");
   return withSecurityHeaders(
-    new Response(body, { status, headers: responseHeaders })
+    new Response(body, { status, headers: responseHeaders }),
   );
 }
 
@@ -156,23 +163,18 @@ function applyAuthorization(headers, env) {
 function isReleasePath(url, env) {
   return matchesRegex(
     url.pathname,
-    env.RELEASE_PATHNAME_REGEX || DEFAULT_RELEASE_PATHNAME_REGEX
+    env.RELEASE_PATHNAME_REGEX || DEFAULT_RELEASE_PATHNAME_REGEX,
   );
 }
 
-// 边缘缓存选项（fetch 的 cf 字段）。
-// release 下载资源按 tag 发布、内容基本不变 → 长缓存；raw 指向分支 → 短缓存。
-// 客户端自带 token 的请求可能拉取私有内容，一律不缓存，避免私有响应被其他用户命中。
-// HEAD 不写缓存（cacheTtl:0 且不 cacheEverything），但仍可命中 GET 已写入的
-// 缓存条目——探活不额外占用缓存。
-function cacheOptions(url, env, clientAuthenticated, isHead) {
-  if (clientAuthenticated || isHead) {
-    return { cacheTtl: 0 };
-  }
-  if (isReleasePath(url, env)) {
-    return { cacheEverything: true, cacheTtl: RELEASE_CACHE_TTL };
-  }
-  return { cacheEverything: true, cacheTtl: RAW_CACHE_TTL };
+function isRawCommitPath(url) {
+  return /^\/[^/]+\/[^/]+\/raw\/[a-f0-9]{40}\//i.test(url.pathname);
+}
+
+function cacheTtl(url, env) {
+  if (isReleasePath(url, env)) return RELEASE_CACHE_TTL;
+  if (isRawCommitPath(url)) return RAW_COMMIT_CACHE_TTL;
+  return RAW_CACHE_TTL;
 }
 
 function setDownstreamCacheControl(
@@ -180,85 +182,75 @@ function setDownstreamCacheControl(
   url,
   env,
   clientAuthenticated,
-  isHead,
-  status
+  method,
+  status,
 ) {
-  if (clientAuthenticated || isHead || status < 200 || status >= 300) {
+  if (
+    clientAuthenticated ||
+    (method !== "GET" && method !== "HEAD") ||
+    status < 200 ||
+    status >= 300
+  ) {
     headers.set("cache-control", "private, no-store");
     return;
   }
 
-  const ttl = isReleasePath(url, env) ? RELEASE_CACHE_TTL : RAW_CACHE_TTL;
+  const ttl = cacheTtl(url, env);
   headers.set("cache-control", `public, max-age=${ttl}`);
 }
 
-async function proxyRequest(request, targetUrl, env) {
+async function proxyRequest(request, env) {
+  const targetUrl = new URL(request.url);
+  // ctx.exports loopback 会把 named entrypoint 的 URL 呈现为 http://；
+  // 在注入 GitHub token 前恢复目标协议，避免重定向时剥离 Authorization。
+  targetUrl.protocol = normalizeProtocol(
+    env.PROXY_PROTOCOL || DEFAULT_PROXY_PROTOCOL,
+  );
+  targetUrl.port = "";
+
   const isHead = request.method === "HEAD";
   const clientAuthenticated = request.headers.has("authorization");
   const headers = new Headers(request.headers);
   stripRequestHeaders(headers);
   applyAuthorization(headers, env);
 
-  // 仅 release asset 的 HEAD 需要 workaround：CF 运行时里 method:HEAD 的子请求
-  // 命中 release GET 写入的 cacheEverything 条目时会返回 401（配置层 cacheTtl:0
-  // 无法绕过，问题在读取那一刻）。raw 的 HEAD 无此问题，保持原样透传。
-  const headAsGet = isHead && isReleasePath(targetUrl, env);
-  // 转 GET 时用 Range: bytes=0-0 只探首字节，省上游/Worker 带宽；仅在客户端
-  // 未自带 Range 时启用，之后把 206 归一成 200（content-length 用完整文件大小）。
-  const rangeProbe = headAsGet && !headers.has("range");
-  if (rangeProbe) {
-    headers.set("range", "bytes=0-0");
-  }
-
   const init = {
-    method: headAsGet ? "GET" : request.method,
+    method: request.method,
     headers,
     redirect: "follow",
-    cf: cacheOptions(targetUrl, env, clientAuthenticated, isHead),
   };
 
   const upstreamResponse = await fetch(new Request(targetUrl.toString(), init));
   const responseHeaders = new Headers(upstreamResponse.headers);
   stripResponseHeaders(responseHeaders);
 
-  let status = upstreamResponse.status;
-  let statusText = upstreamResponse.statusText;
-
-  // 把 Range 探测的 206 归一成一个“真 HEAD”式的 200：
-  // content-length 取 Content-Range 里的完整大小（bytes 0-0/1856 → 1856），删掉 content-range。
-  if (rangeProbe && status === 206) {
-    const contentRange = responseHeaders.get("content-range");
-    const total = contentRange && contentRange.match(/\/(\d+)\s*$/);
-    if (total) {
-      responseHeaders.set("content-length", total[1]);
-    } else {
-      responseHeaders.delete("content-length");
-    }
-    responseHeaders.delete("content-range");
-    status = 200;
-    statusText = "OK";
-  }
-
   setDownstreamCacheControl(
     responseHeaders,
     targetUrl,
     env,
     clientAuthenticated,
-    isHead,
-    status
+    request.method,
+    upstreamResponse.status,
   );
 
   return withSecurityHeaders(
     new Response(isHead ? null : upstreamResponse.body, {
-      status,
-      statusText,
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
       headers: responseHeaders,
-    })
+    }),
   );
 }
 
+// Workers Cache 位于此 entrypoint 之前。命中时不会执行 GitHub fetch。
+export class CachedGitHubProxy extends WorkerEntrypoint {
+  async fetch(request) {
+    return proxyRequest(request, this.env);
+  }
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       if (url.protocol === "http:") {
@@ -282,7 +274,31 @@ export default {
         return textResponse(404, "Not Found");
       }
 
-      return await proxyRequest(request, targetUrl, env);
+      // 客户端 token 可能访问私有内容，完全绕过内部缓存。
+      if (request.headers.has("authorization")) {
+        return await proxyRequest(
+          new Request(targetUrl, {
+            method: request.method,
+            headers: request.headers,
+          }),
+          env,
+        );
+      }
+
+      const headers = new Headers(request.headers);
+      stripRequestHeaders(headers);
+      headers.delete("authorization");
+
+      // Workers Cache 默认不包含 hostname；显式加入目标 host，支持安全地
+      // 调整 PROXY_HOSTNAME，并保留 path/query 作为资源身份。
+      const cacheKey = `/${targetUrl.hostname}${targetUrl.pathname}${targetUrl.search}`;
+      const cachedRequest = new Request(targetUrl, {
+        method: request.method,
+        headers,
+      });
+      return await ctx.exports.CachedGitHubProxy.fetch(cachedRequest, {
+        cf: { cacheKey },
+      });
     } catch (error) {
       logError(request, `Fetch error: ${error.message}`);
       return textResponse(500, "Internal Server Error");
