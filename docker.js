@@ -1,3 +1,5 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+
 // docker.js —— Docker Registry 拉取代理（部署于 docker-proxy 分支 → docker.suzu.sh）
 //
 // 设计边界（pull-only 镜像拉取代理，不是通用 HTTP 代理）：
@@ -15,10 +17,11 @@ const DEFAULT_UPSTREAM = "registry-1.docker.io";
 const DEFAULT_BLOCKED_UA = ["netcraft"];
 const ALLOWED_METHODS = ["GET", "HEAD", "OPTIONS"];
 
-// 边缘缓存 TTL（秒）。blob 按 digest 内容寻址、不可变 → 长缓存。
-// manifest 的同一 URL 会按 Accept 返回不同 media type；在 cache key
-// 显式区分 Accept 前不缓存，避免向客户端返回错误格式。
+// Workers Cache TTL（秒）。blob 与 digest manifest 不可变 → 长缓存；
+// tag manifest 可变 → 短缓存，并通过 Vary: Accept 区分 media type。
 const BLOB_CACHE_TTL = 2592000; // 30 天
+const MANIFEST_DIGEST_CACHE_TTL = 2592000; // 30 天
+const MANIFEST_TAG_CACHE_TTL = 300; // 5 分钟
 
 // 子域前缀 → registry 上游
 const REGISTRY_ROUTES = {
@@ -59,8 +62,8 @@ const PREFLIGHT_HEADERS = {
 function logError(request, message) {
   console.error(
     `${message}, clientIp: ${request.headers.get(
-      "cf-connecting-ip"
-    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
+      "cf-connecting-ip",
+    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`,
   );
 }
 
@@ -109,7 +112,7 @@ function resolveUpstream(url) {
   }
 
   const hostTop = (url.searchParams.get("hubhost") || url.hostname).split(
-    "."
+    ".",
   )[0];
   if (hostTop in REGISTRY_ROUTES) {
     return { host: REGISTRY_ROUTES[hostTop], pathname: url.pathname };
@@ -118,13 +121,14 @@ function resolveUpstream(url) {
   return { host: DEFAULT_UPSTREAM, pathname: url.pathname };
 }
 
-// 边缘缓存选项（fetch 的 cf 字段）。
-// 仅对 blob 缓存；manifest、/v2/ 探测与其它请求不缓存。
-function cacheOptions(pathname) {
-  if (pathname.includes("/blobs/")) {
-    return { cacheEverything: true, cacheTtl: BLOB_CACHE_TTL };
-  }
-  return { cacheTtl: 0 };
+function cacheTtl(pathname) {
+  if (pathname.includes("/blobs/")) return BLOB_CACHE_TTL;
+
+  const manifest = pathname.match(/\/manifests\/([^/]+)$/);
+  if (!manifest) return 0;
+  return /^sha256:[a-f0-9]{64}$/i.test(manifest[1])
+    ? MANIFEST_DIGEST_CACHE_TTL
+    : MANIFEST_TAG_CACHE_TTL;
 }
 
 // 可选访问过滤：命中即拒绝（404）。默认全空 = 不启用。
@@ -249,21 +253,22 @@ function finalize(response, pathname, method, clientAuthenticated) {
       (vary || "")
         .split(",")
         .map((value) => value.trim())
-        .filter(Boolean)
+        .filter(Boolean),
     );
     values.add("Accept");
     headers.set("vary", [...values].join(", "));
   }
 
-  const cacheableBlob =
-    method === "GET" &&
+  const ttl = cacheTtl(pathname);
+  const cacheable =
+    (method === "GET" || method === "HEAD") &&
     !clientAuthenticated &&
     response.status >= 200 &&
     response.status < 300 &&
-    pathname.includes("/blobs/");
+    ttl > 0;
   headers.set(
     "cache-control",
-    cacheableBlob ? `public, max-age=${BLOB_CACHE_TTL}` : "private, no-store"
+    cacheable ? `public, max-age=${ttl}` : "private, no-store",
   );
 
   return new Response(response.body, {
@@ -271,6 +276,62 @@ function finalize(response, pathname, method, clientAuthenticated) {
     statusText: response.statusText,
     headers,
   });
+}
+
+// 执行一次实际的 registry 请求。可缓存请求由 CachedRegistryProxy 调用；
+// 鉴权请求和非缓存路径由默认入口直接调用，完全绕过 Workers Cache。
+async function proxyUpstream(request, env) {
+  const upstreamUrl = new URL(request.url);
+  // ctx.exports loopback 会把传给 named entrypoint 的 URL 呈现为 http://；
+  // 上游 Bearer 请求若跟随 http → https 跳转，Authorization 会被剥离。
+  upstreamUrl.protocol = "https:";
+  upstreamUrl.port = "";
+  const upstreamHost = upstreamUrl.hostname;
+  const pathname = upstreamUrl.pathname;
+  const clientAuthenticated = request.headers.has("authorization");
+  const forwardHeaders = buildForwardHeaders(request);
+
+  // 匿名探测只存在于本次 Worker 执行中；401 不会作为最终响应写入缓存。
+  let response = await fetch(
+    new Request(upstreamUrl, {
+      method: request.method,
+      headers: forwardHeaders,
+      redirect: "follow",
+    }),
+  );
+
+  if (response.status === 401) {
+    const wwwAuth = response.headers.get("www-authenticate");
+    if (wwwAuth && /bearer/i.test(wwwAuth)) {
+      const parsed = parseAuthenticate(wwwAuth);
+      const tokenResult = await fetchUpstreamToken(
+        parsed,
+        request,
+        env,
+        upstreamHost,
+      );
+      if (tokenResult && tokenResult.token) {
+        const authHeaders = new Headers(forwardHeaders);
+        authHeaders.set("Authorization", `Bearer ${tokenResult.token}`);
+        response = await fetch(
+          new Request(upstreamUrl, {
+            method: request.method,
+            headers: authHeaders,
+            redirect: "follow",
+          }),
+        );
+      }
+    }
+  }
+
+  return finalize(response, pathname, request.method, clientAuthenticated);
+}
+
+// Workers Cache 位于此 entrypoint 之前。命中时不会执行 token 获取或上游 fetch。
+export class CachedRegistryProxy extends WorkerEntrypoint {
+  async fetch(request) {
+    return proxyUpstream(request, this.env);
+  }
 }
 
 function plain(status, body) {
@@ -281,7 +342,7 @@ function plain(status, body) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
@@ -357,58 +418,30 @@ export default {
       upstreamUrl.searchParams.delete("ns");
       upstreamUrl.searchParams.delete("hubhost");
 
-      // 缓存策略：仅 blob 内容寻址不可变，长缓存；其它请求不缓存。
-      // 关键：匿名首请求（challenge 探测）不缓存，否则 401 会被缓存导致鉴权永远失败；
-      // 只有带 token 的成功响应才进边缘缓存。
-      const cfCache = cacheOptions(pathname);
-
-      // 匿名首请求：challenge 探测，必然可能返回 401，强制不缓存。
       const clientAuthenticated = request.headers.has("authorization");
-      const forwardHeaders = buildForwardHeaders(request);
-      let response = await fetch(
-        new Request(upstreamUrl, {
-          method: request.method,
-          headers: forwardHeaders,
-          redirect: "follow",
-          cf: { cacheTtl: 0 },
-        })
-      );
+      const ttl = cacheTtl(pathname);
 
-      // 动态鉴权：上游 401 → 按 challenge 取 token → 带 token 重放。
-      if (response.status === 401) {
-        const wwwAuth = response.headers.get("www-authenticate");
-        if (wwwAuth && /bearer/i.test(wwwAuth)) {
-          const parsed = parseAuthenticate(wwwAuth);
-          const { token } = await fetchUpstreamToken(
-            parsed,
-            request,
-            env,
-            upstreamHost
-          );
-          if (token) {
-            const authHeaders = new Headers(forwardHeaders);
-            authHeaders.set("Authorization", `Bearer ${token}`);
-            // 匿名首请求用 cacheTtl:0 且无 cacheEverything，401 不会进缓存，
-            // 故重放可复用同一 URL，无 cache-key 碰撞。
-            // 服务端凭据仅提升公开仓库额度；客户端自带鉴权的请求仍不缓存。
-            response = await fetch(
-              new Request(upstreamUrl, {
-                method: request.method,
-                headers: authHeaders,
-                redirect: "follow",
-                cf: clientAuthenticated ? { cacheTtl: 0 } : cfCache,
-              })
-            );
-          }
-        }
+      // 客户端鉴权请求与动态 registry API 不经过缓存入口。
+      if (clientAuthenticated || ttl === 0) {
+        return await proxyUpstream(
+          new Request(upstreamUrl, {
+            method: request.method,
+            headers: request.headers,
+          }),
+          env,
+        );
       }
 
-      return finalize(
-        response,
-        pathname,
-        request.method,
-        clientAuthenticated
-      );
+      // 默认 Workers Cache 不包含 hostname；将解析后的 registry host 放入
+      // 自定义 key，避免不同 registry 的相同路径互相污染。
+      const cacheKey = `/${upstreamHost}${pathname}${upstreamUrl.search}`;
+      const cachedRequest = new Request(upstreamUrl, {
+        method: request.method,
+        headers: buildForwardHeaders(request),
+      });
+      return await ctx.exports.CachedRegistryProxy.fetch(cachedRequest, {
+        cf: { cacheKey },
+      });
     } catch (error) {
       logError(request, `Fetch error: ${error.message}`);
       return plain(500, "Internal Server Error");

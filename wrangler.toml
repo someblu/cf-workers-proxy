@@ -1,3 +1,18 @@
 name = "docker-proxy"
 main = "docker.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-07-24"
+
+[cache]
+enabled = true
+
+[exports.default]
+type = "worker"
+
+  [exports.default.cache]
+  enabled = false
+
+[exports.CachedRegistryProxy]
+type = "worker"
+
+  [exports.CachedRegistryProxy.cache]
+  enabled = true
